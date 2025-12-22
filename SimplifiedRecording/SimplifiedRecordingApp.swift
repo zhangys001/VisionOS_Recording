@@ -275,7 +275,7 @@ class ModelManager: ObservableObject {
             defer { url.stopAccessingSecurityScopedResource() }
             
             let entity = try await ModelEntity(contentsOf: url)
-            entity.scale = SIMD3<Float>(1.0, 1.0, 1.0)
+            entity.scale = SIMD3<Float>(repeating: 0.5)
             entity.position = SIMD3<Float>(0, 0, -3)
             entity.name = "UserModel" // 确保有名字，方便 ImmersiveView 查找和替换
             
@@ -359,7 +359,7 @@ struct ImmersiveView: View {
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     
     var body: some View {
-        RealityView { content in
+        RealityView { content, attachments in
             // 创建地板
             let floor = MeshResource.generatePlane(width: 10, depth: 10)
             let floorMaterial = SimpleMaterial(
@@ -377,36 +377,73 @@ struct ImmersiveView: View {
             centralLight.position = [0, 2, 0]
             content.add(centralLight)
             
-        } update: { content in
-            // 移除旧模型
-            if let existingModel = content.entities.first(where: { $0.name == "UserModel" }) {
-                content.remove(existingModel)
+            // 首次添加录制指示器附件实体（使用头部锚点固定）
+            if let indicatorView = attachments.entity(for: "recordingIndicator") {
+                let anchorEntity = AnchorEntity(.head)
+                indicatorView.position = SIMD3<Float>(0, 0.15, -0.5)
+                anchorEntity.addChild(indicatorView)
+                content.add(anchorEntity)
             }
             
-            // 添加新模型
-            if let model = modelManager.currentModel {
+        }
+        // ImmersiveView.swift -> update 闭包
+
+        // 修改 ImmersiveView.swift 中的 update 部分
+        update: { content, attachments in
+            // 1. 检查是否已经存在模型锚点
+            let existingAnchor = content.entities.first { $0.name == "UserModelAnchor" }
+            
+            // 2. 如果 modelManager 中没有模型，但场景中有，则移除
+            if modelManager.currentModel == nil {
+                if let anchor = existingAnchor {
+                    content.remove(anchor)
+                }
+                return
+            }
+            
+            // 3. 只有当场景中还没有模型时，才添加（防止每帧重复添加导致消失）
+            if existingAnchor == nil, let model = modelManager.currentModel {
                 let clonedModel = model.clone(recursive: true)
-                clonedModel.name = "UserModel"
+                
+                // 创建一个追踪头部的锚点（解决你之前提到的视角跟随问题）
+                let headAnchor = AnchorEntity(.head)
+                headAnchor.name = "UserModelAnchor"
+                
+                // 将模型放在用户前方 3 米
                 clonedModel.position = SIMD3<Float>(0, 0, -3)
-                content.add(clonedModel)
+                headAnchor.addChild(clonedModel)
+                
+                content.add(headAnchor)
+            }
+            
+            // 4. 更新录制指示器（逻辑保持不变，但确保它不被上面的清理逻辑误伤）
+            if recordingManager.isRecording,
+               let indicator = attachments.entity(for: "recordingIndicator") {
+                if indicator.parent == nil {
+                    let indicatorAnchor = AnchorEntity(.head)
+                    indicatorAnchor.name = "IndicatorAnchor"
+                    indicator.position = [0, 0.15, -0.5]
+                    indicatorAnchor.addChild(indicator)
+                    content.add(indicatorAnchor)
+                }
             }
         }
-        .overlay(alignment: .top) {
-            VStack(spacing: 12) {
+
+        attachments: {
+            // 关键：定义附件内容
+            Attachment(id: "recordingIndicator") {
                 if recordingManager.isRecording {
                     RecordingIndicator(duration: recordingManager.recordingDuration)
+                        .glassBackgroundEffect()
                 }
-                // 在 ImmersiveView 内不再提供退出按钮（由 ContentView 控制退出）
             }
-            .padding(.top, 50)
         }
-        // 监听来自 ContentView 的“在沉浸式内开始录制”请求
         .onReceive(NotificationCenter.default.publisher(for: .startRecordingInImmersive)) { _ in
-            // 在沉浸式上下文内启动录制，使用已有的录制管理器逻辑
             recordingManager.startRecording()
         }
     }
 }
+
 
 // MARK: - 主视图
 
@@ -498,21 +535,11 @@ struct ContentView: View {
                             // 确保只有模型加载后才能进入
                             guard modelManager.currentModel != nil else { return }
                             
-                            if recordingManager.isRecording {
-                                // 如果当前正在录制：先停止录制，打开沉浸式后再重新启动录制
-                                recordingManager.stopRecording { _ in
-                                    Task {
-                                        await openImmersiveSpace(id: "ImmersiveSpace")
-                                        isImmersiveSpaceOpen = true
-                                        // 重新启动录制以确保 ReplayKit 捕获沉浸式视图上下文
-                                        recordingManager.startRecording()
-                                    }
-                                }
-                            } else {
-                                // 没在录制，直接打开沉浸式
-                                await openImmersiveSpace(id: "ImmersiveSpace")
-                                isImmersiveSpaceOpen = true
-                            }
+                            await openImmersiveSpace(id: "ImmersiveSpace")
+                            isImmersiveSpaceOpen = true
+                            
+                            try? await Task.sleep(for: .seconds(1)) // 给予缓冲时间
+                            recordingManager.startRecording()
                         }
                     }) {
                         Label("进入沉浸式空间", systemImage: "visionpro")
@@ -652,7 +679,7 @@ struct ContentView: View {
                 recordingManager.errorMessage = nil
                 modelManager.modelLoadError = nil
             }
-        } 
+        }
         // 录制结束/保存结果提示
         .alert("录制结束", isPresented: $showSaveAlert) {
             Button("确定") {
