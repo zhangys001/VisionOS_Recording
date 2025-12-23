@@ -173,6 +173,7 @@ class ScreenRecordingManager: ObservableObject {
     }
     
     private func setupVideoWriter(width: Int, height: Int, startTime: CMTime) -> Bool {
+        
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let timestamp = Int(Date().timeIntervalSince1970)
         let videoPath = documentsPath.appendingPathComponent("recording_\(timestamp).mp4")
@@ -220,28 +221,44 @@ class ScreenRecordingManager: ObservableObject {
     }
     
     private func finalizeVideo(completion: @escaping (URL?) -> Void) {
+        // 1. 检查 writer 和 input 是否存在
         guard let writer = videoWriter, let input = videoWriterInput else {
+            print("Finalize: Writer 或 Input 为空")
             completion(nil)
             return
         }
-        
-        input.markAsFinished()
-        
-        writer.finishWriting {
-            DispatchQueue.main.async {
-                if writer.status == .completed {
-                    completion(writer.outputURL)
-                } else {
-                    print("文件写入最终失败: \(String(describing: writer.error))")
-                    completion(nil)
+
+        // 2. 只有在状态为 writing (status == 1) 时才能结束
+        if writer.status == .writing {
+            input.markAsFinished()
+            
+            // 关键修复：直接调用 finishWriting，不要在里面加复杂的判断
+            writer.finishWriting {
+                DispatchQueue.main.async {
+                    if writer.status == .completed {
+                        print("录制成功完成: \(writer.outputURL)")
+                        completion(writer.outputURL)
+                    } else {
+                        print("录制失败，状态: \(writer.status.rawValue), 错误: \(String(describing: writer.error))")
+                        completion(nil)
+                    }
+                    self.cleanupWriter()
                 }
-                
-                self.videoWriter = nil
-                self.videoWriterInput = nil
-                self.isWriterInitialized = false
             }
+        } else {
+            print("警告：尝试结束录制时 Writer 状态不正确: \(writer.status.rawValue)")
+            self.cleanupWriter()
+            completion(nil)
         }
     }
+
+    // 提取清理逻辑，确保资源释放
+    private func cleanupWriter() {
+        self.videoWriter = nil
+        self.videoWriterInput = nil
+        self.isWriterInitialized = false
+    }
+
     
     private func startDurationTimer() {
         recordingTimer?.invalidate()
@@ -388,46 +405,55 @@ struct ImmersiveView: View {
         }
         // ImmersiveView.swift -> update 闭包
 
-        // 修改 ImmersiveView.swift 中的 update 部分
         update: { content, attachments in
-            // 1. 检查是否已经存在模型锚点
-            let existingAnchor = content.entities.first { $0.name == "UserModelAnchor" }
+            // 1. 获取或创建随头动的容器
+            let containerName = "InverseMovingContainer"
+            var container = content.entities.first { $0.name == containerName }
             
-            // 2. 如果 modelManager 中没有模型，但场景中有，则移除
-            if modelManager.currentModel == nil {
-                if let anchor = existingAnchor {
-                    content.remove(anchor)
-                }
-                return
-            }
-            
-            // 3. 只有当场景中还没有模型时，才添加（防止每帧重复添加导致消失）
-            if existingAnchor == nil, let model = modelManager.currentModel {
-                let clonedModel = model.clone(recursive: true)
-                
-                // 创建一个追踪头部的锚点（解决你之前提到的视角跟随问题）
+            if container == nil {
                 let headAnchor = AnchorEntity(.head)
-                headAnchor.name = "UserModelAnchor"
-                
-                // 将模型放在用户前方 3 米
-                clonedModel.position = SIMD3<Float>(0, 0, -3)
-                headAnchor.addChild(clonedModel)
-                
+                headAnchor.name = containerName
                 content.add(headAnchor)
+                container = headAnchor
             }
             
-            // 4. 更新录制指示器（逻辑保持不变，但确保它不被上面的清理逻辑误伤）
-            if recordingManager.isRecording,
-               let indicator = attachments.entity(for: "recordingIndicator") {
+            // 2. 确保模型已加载
+            if let model = modelManager.currentModel, container?.children.isEmpty == true {
+                let cloned = model.clone(recursive: true)
+                cloned.name = "MyVisualModel"
+                container?.addChild(cloned)
+            }
+            
+            // 3. 【核心修复】计算逆变换以锁定世界位置
+            if let container = container, let modelEntity = container.findEntity(named: "MyVisualModel") {
+                // 获取头部在世界中的实时变换
+                let headMatrix = container.transformMatrix(relativeTo: nil)
+                
+                // 如果矩阵无效（全0），跳过本帧
+                guard headMatrix.columns.3.w != 0 else { return }
+                
+                // 我们希望模型在世界坐标中的位置始终是 [0, 1.2, -2.0] (水平面以上1.2米，前方2米)
+                var targetWorldMatrix = matrix_identity_float4x4
+                targetWorldMatrix.columns.3 = [0, 1.2, -2.0, 1]
+                
+                // 计算公式：模型在容器内的本地变换 = 容器(头)世界变换的逆 * 目标世界变换
+                let localMatrix = headMatrix.inverse * targetWorldMatrix
+                
+                modelEntity.setTransformMatrix(localMatrix, relativeTo: container)
+            }
+            
+            // 录制指示器跟随头部（保持在视线上方）
+            if recordingManager.isRecording, let indicator = attachments.entity(for: "recordingIndicator") {
                 if indicator.parent == nil {
                     let indicatorAnchor = AnchorEntity(.head)
-                    indicatorAnchor.name = "IndicatorAnchor"
-                    indicator.position = [0, 0.15, -0.5]
+                    indicator.position = [0, 0.4, -0.8]
                     indicatorAnchor.addChild(indicator)
                     content.add(indicatorAnchor)
                 }
             }
         }
+
+
 
         attachments: {
             // 关键：定义附件内容
@@ -538,8 +564,6 @@ struct ContentView: View {
                             await openImmersiveSpace(id: "ImmersiveSpace")
                             isImmersiveSpaceOpen = true
                             
-                            try? await Task.sleep(for: .seconds(1)) // 给予缓冲时间
-                            recordingManager.startRecording()
                         }
                     }) {
                         Label("进入沉浸式空间", systemImage: "visionpro")
